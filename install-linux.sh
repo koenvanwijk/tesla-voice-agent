@@ -31,6 +31,8 @@ info "Installing Ubuntu/Debian prerequisites..."
 $SUDO apt-get update
 $SUDO apt-get install -y python3 python3-venv python3-pip ffmpeg curl git ca-certificates
 
+command -v systemctl >/dev/null 2>&1 || die "systemd/systemctl is required for the persistent service install."
+
 if ! python3 - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
@@ -63,7 +65,7 @@ if ! command -v ollama >/dev/null 2>&1; then
   curl -fsSL https://ollama.com/install.sh | sh
 fi
 
-if systemctl list-unit-files ollama.service >/dev/null 2>&1; then
+if systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'ollama.service'; then
   $SUDO systemctl enable --now ollama.service
 elif ! curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
   warn "No ollama.service found; starting Ollama for this boot."
