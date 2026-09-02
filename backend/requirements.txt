@@ -1,0 +1,6 @@
+fastapi>=0.116,<1
+uvicorn[standard]>=0.35,<1
+python-multipart>=0.0.20,<1
+httpx>=0.28,<1
+faster-whisper>=1.2,<2
+python-dotenv>=1.1,<2
