@@ -8,7 +8,7 @@ No OpenAI API or other cloud AI API is required.
 
 Recommended setup:
 
-`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> laptop:8787 -> faster-whisper -> Ollama streaming -> Piper TTS per sentence -> Tesla Web Audio queue`
+`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> Linux laptop:8787 -> faster-whisper -> Ollama streaming -> Piper TTS per sentence -> Tesla Web Audio queue`
 
 - **Speech-to-text:** `faster-whisper`, local on the laptop
 - **LLM:** Ollama, local on the laptop
@@ -16,31 +16,43 @@ Recommended setup:
 - **Low-latency behavior:** Ollama tokens are grouped into speakable sentences; each completed sentence is synthesized and sent immediately instead of waiting for the whole answer
 - **Playback:** queued Web Audio in the Tesla browser
 - **Ingress/auth:** NVIDIA Brev Secure Link/Tunnel
-- **Frontend:** served by the laptop for normal use; also deployed to GitHub Pages for testing/launcher use
+- **Frontend:** served by the laptop for normal use; also deployable to GitHub Pages for testing/launcher use
 
 Serving frontend and API from the same Brev URL avoids cross-origin authentication problems.
 
-## Windows quick start
+## Linux quick start
+
+Designed primarily for Ubuntu/Debian-style Linux systems.
 
 Prerequisites:
 
-1. Python 3.11
-2. Ollama
-3. NVIDIA Brev access to this laptop / registered compute
+1. Python 3.10+ (3.11 recommended)
+2. `python3-venv` / venv support
+3. `ffmpeg`
+4. Ollama
+5. NVIDIA Brev access to this laptop / registered compute
 
-Clone the repository and run:
+Typical Ubuntu/Debian prerequisites:
 
-```powershell
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg curl git
+```
+
+Install Ollama if it is not already installed, then clone and start:
+
+```bash
 git clone https://github.com/koenvanwijk/tesla-voice-agent.git
 cd tesla-voice-agent
-powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
+bash start-linux.sh
 ```
 
 If you already cloned an earlier version:
 
-```powershell
+```bash
+cd tesla-voice-agent
 git pull
-powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
+bash start-linux.sh
 ```
 
 The script will:
@@ -48,20 +60,19 @@ The script will:
 1. create `.venv`
 2. install the Python dependencies, including Piper
 3. copy `backend/.env.example` to `backend/.env` on first run
-4. download the configured Dutch Piper voice (`nl_NL-pim-medium` by default)
+4. verify `ffmpeg`
 5. start Ollama if necessary
 6. pull the configured Ollama model (`qwen3:4b` by default)
-7. start the UI + API at `http://127.0.0.1:8787`
+7. download the configured Dutch Piper voice (`nl_NL-pim-medium` by default)
+8. start the UI + API at `http://127.0.0.1:8787`
 
 The first voice turn also downloads the configured Whisper model if it is not cached yet.
 
 ## Expose through NVIDIA Brev
 
-Expose **port 8787** using the Secure Link/Tunnel functionality for your Brev-connected machine.
+Expose **port 8787** using the Secure Link/Tunnel functionality for your Brev-connected laptop.
 
-In the Brev console, add port `8787` under the machine's access/tunnel section and copy the generated HTTPS URL. Brev's tunnel layer performs browser authentication before exposing the HTTP application.
-
-Open that HTTPS URL directly in the Tesla browser. This is the recommended production URL; do not use the raw laptop IP on the public internet.
+Open the generated Brev HTTPS URL directly in the Tesla browser. This is the recommended production URL; do not expose the raw laptop port directly to the public internet.
 
 ## Tesla use
 
@@ -104,14 +115,16 @@ SERVE_FRONTEND=1
 
 `PIPER_LENGTH_SCALE` controls speaking speed: lower is faster. Piper runs on CPU by default so Ollama can keep the GPU for the LLM.
 
-For an NVIDIA GPU with a compatible CTranslate2 installation you can experiment with:
+### NVIDIA GPU option
+
+If the Linux laptop has a supported NVIDIA GPU and CTranslate2 CUDA support is working, you can switch Whisper to the GPU:
 
 ```dotenv
 WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
 ```
 
-The default CPU/int8 Whisper + CPU Piper configuration is intentionally portable and avoids GPU contention with Ollama.
+The default CPU/int8 Whisper + CPU Piper configuration is intentionally portable and leaves the GPU mostly available to Ollama.
 
 ### Optional second authentication layer
 
@@ -122,6 +135,10 @@ VOICE_AGENT_TOKEN=some-long-random-secret
 ```
 
 Then enter the same token under **Instellingen** in the web UI.
+
+## Windows fallback
+
+A `start-windows.ps1` launcher remains in the repository, but Linux is now the primary supported host setup.
 
 ## GitHub Pages
 
