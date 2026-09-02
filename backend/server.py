@@ -1,8 +1,11 @@
 import asyncio
+import base64
+import io
 import os
 import tempfile
 import time
 import uuid
+import wave
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
+from piper import PiperVoice, SynthesisConfig
 
 load_dotenv()
 
@@ -23,6 +27,13 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+PIPER_VOICE = os.getenv("PIPER_VOICE", "nl_NL-pim-medium").strip()
+_piper_voice_dir = Path(os.getenv("PIPER_VOICE_DIR", "backend/voices"))
+PIPER_VOICE_DIR = _piper_voice_dir if _piper_voice_dir.is_absolute() else ROOT / _piper_voice_dir
+PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "0.95"))
+PIPER_NOISE_SCALE = float(os.getenv("PIPER_NOISE_SCALE", "0.667"))
+PIPER_NOISE_W_SCALE = float(os.getenv("PIPER_NOISE_W_SCALE", "0.8"))
+PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "0") == "1"
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(12 * 1024 * 1024)))
 SERVE_FRONTEND = os.getenv("SERVE_FRONTEND", "1") != "0"
@@ -54,13 +65,13 @@ app.add_middleware(
 )
 
 _whisper_model = None
+_piper_voice = None
 _whisper_lock = asyncio.Lock()
+_piper_lock = asyncio.Lock()
 _histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
 
 
 def require_token(authorization: str | None) -> None:
-    # Brev Secure Link/Tunnel can be the authentication layer. Set a token as
-    # an optional second layer when using another ingress.
     if not TOKEN:
         return
     if authorization != f"Bearer {TOKEN}":
@@ -78,6 +89,20 @@ def get_whisper_model() -> WhisperModel:
     return _whisper_model
 
 
+def get_piper_voice() -> PiperVoice:
+    global _piper_voice
+    if _piper_voice is None:
+        model_path = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx"
+        config_path = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx.json"
+        if not model_path.exists() or not config_path.exists():
+            raise RuntimeError(
+                f"Piper voice '{PIPER_VOICE}' is missing in {PIPER_VOICE_DIR}. "
+                "Run start-windows.ps1 again to download it."
+            )
+        _piper_voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=PIPER_USE_CUDA)
+    return _piper_voice
+
+
 def transcribe_file(path: str) -> str:
     model = get_whisper_model()
     segments, _ = model.transcribe(
@@ -88,6 +113,31 @@ def transcribe_file(path: str) -> str:
         condition_on_previous_text=False,
     )
     return " ".join(s.text.strip() for s in segments).strip()
+
+
+def synthesize_wav(text: str) -> bytes:
+    voice = get_piper_voice()
+    syn_config = SynthesisConfig(
+        length_scale=PIPER_LENGTH_SCALE,
+        noise_scale=PIPER_NOISE_SCALE,
+        noise_w_scale=PIPER_NOISE_W_SCALE,
+    )
+
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wav_file:
+        configured = False
+        for chunk in voice.synthesize(text, syn_config):
+            if not configured:
+                wav_file.setframerate(chunk.sample_rate)
+                wav_file.setsampwidth(chunk.sample_width)
+                wav_file.setnchannels(chunk.sample_channels)
+                configured = True
+            wav_file.writeframes(chunk.audio_int16_bytes)
+
+        if not configured:
+            raise RuntimeError("Piper produced no audio")
+
+    return wav_io.getvalue()
 
 
 async def ask_ollama(session_id: str, user_text: str) -> str:
@@ -138,6 +188,9 @@ async def health():
     except Exception:
         pass
 
+    piper_model = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx"
+    piper_config = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx.json"
+
     return {
         "ok": True,
         "ollama": ollama_ok,
@@ -148,6 +201,9 @@ async def health():
         ),
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
+        "piper_voice": PIPER_VOICE,
+        "piper_ready": piper_model.exists() and piper_config.exists(),
+        "piper_cuda": PIPER_USE_CUDA,
         "token_required": bool(TOKEN),
     }
 
@@ -192,8 +248,11 @@ async def turn(
             "session_id": session_id,
             "transcript": "",
             "reply": "",
+            "audio_b64": "",
+            "audio_mime": "audio/wav",
             "stt_ms": stt_ms,
             "llm_ms": 0,
+            "tts_ms": 0,
             "total_ms": round((time.perf_counter() - started) * 1000),
         }
 
@@ -201,16 +260,26 @@ async def turn(
     reply = await ask_ollama(session_id, transcript)
     llm_ms = round((time.perf_counter() - t1) * 1000)
 
+    try:
+        t2 = time.perf_counter()
+        async with _piper_lock:
+            wav_bytes = await asyncio.to_thread(synthesize_wav, reply)
+        tts_ms = round((time.perf_counter() - t2) * 1000)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Piper TTS failed: {exc}") from exc
+
     return {
         "session_id": session_id,
         "transcript": transcript,
         "reply": reply,
+        "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+        "audio_mime": "audio/wav",
         "stt_ms": stt_ms,
         "llm_ms": llm_ms,
+        "tts_ms": tts_ms,
         "total_ms": round((time.perf_counter() - started) * 1000),
     }
 
 
 if SERVE_FRONTEND and FRONTEND.exists():
-    # Mounted last so /api/* and /health keep precedence.
     app.mount("/", StaticFiles(directory=str(FRONTEND), html=True), name="frontend")
