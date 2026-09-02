@@ -1,0 +1,10 @@
+{
+  "name": "Tesla Voice Agent",
+  "short_name": "Voice Agent",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d0d0f",
+  "theme_color": "#111111",
+  "description": "Hands-free local AI voice assistant for the Tesla browser"
+}
