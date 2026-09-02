@@ -8,12 +8,13 @@ No OpenAI API or other cloud AI API is required.
 
 Recommended setup:
 
-`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> laptop:8787 -> faster-whisper -> Ollama -> Piper TTS -> Tesla Web Audio`
+`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> laptop:8787 -> faster-whisper -> Ollama streaming -> Piper TTS per sentence -> Tesla Web Audio queue`
 
 - **Speech-to-text:** `faster-whisper`, local on the laptop
 - **LLM:** Ollama, local on the laptop
 - **Speech output:** Piper TTS, local on the laptop
-- **Playback:** Web Audio in the Tesla browser
+- **Low-latency behavior:** Ollama tokens are grouped into speakable sentences; each completed sentence is synthesized and sent immediately instead of waiting for the whole answer
+- **Playback:** queued Web Audio in the Tesla browser
 - **Ingress/auth:** NVIDIA Brev Secure Link/Tunnel
 - **Frontend:** served by the laptop for normal use; also deployed to GitHub Pages for testing/launcher use
 
@@ -70,8 +71,11 @@ Open that HTTPS URL directly in the Tesla browser. This is the recommended produ
 4. Allow microphone access.
 5. Talk normally.
 6. Roughly 0.9 seconds of silence ends the turn automatically.
-7. The laptop transcribes, answers and synthesizes the Dutch voice locally.
-8. The Tesla plays the returned WAV through its already-activated Web Audio context and then starts listening again.
+7. The laptop transcribes the turn locally.
+8. Ollama starts generating the answer as a stream.
+9. As soon as a complete sentence is available, Piper synthesizes that sentence locally and sends a WAV chunk to the Tesla.
+10. The Tesla queues and plays those chunks while the backend continues producing later sentences.
+11. When the response and audio queue are both finished, listening resumes automatically.
 
 The client requests browser echo cancellation, noise suppression and auto gain control and adapts its voice threshold to ambient cabin noise.
 
@@ -139,40 +143,49 @@ If GitHub Pages has not yet been enabled for the repository, go to **Settings ->
 GET /health
 ```
 
-The response includes Ollama, Whisper and Piper state. A healthy local voice setup reports `piper_ready: true`.
+A healthy setup reports at least:
 
-### Voice turn
+```json
+{
+  "ollama": true,
+  "piper_ready": true,
+  "streaming_tts": true
+}
+```
+
+### Streaming voice turn
+
+The Tesla UI uses:
 
 ```http
-POST /api/turn
+POST /api/stream-turn
 Content-Type: multipart/form-data
 X-Session-ID: <conversation-id>
 ```
 
 Form field: `audio` (`webm` or `ogg` from MediaRecorder).
 
-Example response (audio shortened here):
+The response is `application/x-ndjson`. Events look like:
 
 ```json
-{
-  "session_id": "...",
-  "transcript": "Wat staat er vandaag op de planning?",
-  "reply": "...",
-  "audio_b64": "UklGR...",
-  "audio_mime": "audio/wav",
-  "stt_ms": 530,
-  "llm_ms": 410,
-  "tts_ms": 115,
-  "total_ms": 1060
-}
+{"type":"transcript","text":"Wat staat er vandaag op de planning?","stt_ms":530}
+{"type":"text","delta":"Je hebt "}
+{"type":"text","delta":"om tien uur een afspraak."}
+{"type":"audio","audio_b64":"UklGR...","audio_mime":"audio/wav","tts_ms":110}
+{"type":"done","reply":"Je hebt om tien uur een afspraak.","first_audio_ms":820,"total_ms":1150}
 ```
+
+`first_audio_ms` is the useful latency metric for the in-car experience: time from the uploaded speech turn until the first synthesized audio chunk is ready.
+
+### Non-streaming compatibility endpoint
+
+`POST /api/turn` remains available and returns one complete base64-encoded WAV after the entire LLM answer has been generated.
 
 ## Why this stack?
 
-This version deliberately uses a modular local pipeline rather than a cloud or end-to-end speech model:
-
 - no AI cloud dependency
 - Dutch STT and TTS both run locally
+- first speech can start before the LLM has finished the whole answer
 - easy to debug
 - models are replaceable independently
 - Ollama gives many local model choices
@@ -180,4 +193,4 @@ This version deliberately uses a modular local pipeline rather than a cloud or e
 - Piper has native Dutch (`nl_NL`) voices and is lightweight enough to run beside Ollama
 - Brev gives a secure route to the laptop
 
-A next latency upgrade can stream LLM tokens into Piper sentence-by-sentence instead of waiting for the entire answer before speech synthesis starts.
+A later upgrade can add true barge-in: keep listening while the agent speaks and immediately stop current audio/generation when you start talking.
