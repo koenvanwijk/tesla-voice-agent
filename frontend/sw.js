@@ -1,4 +1,4 @@
-const CACHE = 'tesla-voice-agent-v1';
+const CACHE = 'tesla-voice-agent-v2';
 const SHELL = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest'];
 
 self.addEventListener('install', event => {
