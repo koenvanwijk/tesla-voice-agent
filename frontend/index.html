@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#111111" />
+  <title>Tesla Voice Agent</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>Tesla Voice Agent</h1>
+        <p id="status">Klaar om te starten</p>
+      </div>
+      <div id="indicator" class="indicator idle" aria-hidden="true"></div>
+    </header>
+
+    <section class="hero">
+      <button id="mainButton" class="main-button" type="button">START</button>
+      <div class="meter"><div id="meterFill"></div></div>
+      <p class="hint">Praat normaal. Na een korte stilte wordt je vraag automatisch verstuurd.</p>
+    </section>
+
+    <section id="conversation" class="conversation" aria-live="polite"></section>
+
+    <details class="settings">
+      <summary>Instellingen</summary>
+      <label>
+        Backend URL
+        <input id="backendUrl" type="url" inputmode="url" placeholder="https://..." />
+      </label>
+      <label>
+        Optioneel bearer token
+        <input id="backendToken" type="password" autocomplete="off" placeholder="alleen als VOICE_AGENT_TOKEN is ingesteld" />
+      </label>
+      <div class="settings-row">
+        <button id="saveSettings" type="button">Opslaan</button>
+        <button id="testBackend" type="button">Test backend</button>
+      </div>
+      <pre id="healthResult"></pre>
+    </details>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
