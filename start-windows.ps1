@@ -31,6 +31,38 @@ if (-not (Test-Path "backend\.env")) {
   Write-Host "Created backend\.env from example." -ForegroundColor Yellow
 }
 
+$EnvFile = Get-Content "backend\.env" -ErrorAction SilentlyContinue
+
+# Download the configured Piper voice if necessary.
+$Voice = "nl_NL-pim-medium"
+$VoiceLine = $EnvFile | Where-Object { $_ -match '^PIPER_VOICE=' } | Select-Object -First 1
+if ($VoiceLine) { $Voice = ($VoiceLine -replace '^PIPER_VOICE=', '').Trim() }
+
+$VoiceDirValue = "backend/voices"
+$VoiceDirLine = $EnvFile | Where-Object { $_ -match '^PIPER_VOICE_DIR=' } | Select-Object -First 1
+if ($VoiceDirLine) { $VoiceDirValue = ($VoiceDirLine -replace '^PIPER_VOICE_DIR=', '').Trim() }
+
+if ([System.IO.Path]::IsPathRooted($VoiceDirValue)) {
+  $VoiceDir = $VoiceDirValue
+} else {
+  $VoiceDir = Join-Path $RepoRoot $VoiceDirValue
+}
+
+New-Item -ItemType Directory -Path $VoiceDir -Force | Out-Null
+$VoiceModel = Join-Path $VoiceDir "$Voice.onnx"
+$VoiceConfig = Join-Path $VoiceDir "$Voice.onnx.json"
+
+if (-not (Test-Path $VoiceModel) -or -not (Test-Path $VoiceConfig)) {
+  Write-Host "Downloading Dutch Piper voice '$Voice'..."
+  & $VenvPython -m piper.download_voices --download-dir $VoiceDir $Voice
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "Failed to download Piper voice '$Voice'." -ForegroundColor Red
+    exit 1
+  }
+} else {
+  Write-Host "Piper voice '$Voice' is ready."
+}
+
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
   Write-Host "Ollama is not installed or not on PATH. Install Ollama first, then rerun this script." -ForegroundColor Red
   Write-Host "https://ollama.com/download/windows"
@@ -50,7 +82,6 @@ if (-not $OllamaUp) {
 }
 
 $Model = "qwen3:4b"
-$EnvFile = Get-Content "backend\.env" -ErrorAction SilentlyContinue
 $ModelLine = $EnvFile | Where-Object { $_ -match '^OLLAMA_MODEL=' } | Select-Object -First 1
 if ($ModelLine) { $Model = ($ModelLine -replace '^OLLAMA_MODEL=', '').Trim() }
 
@@ -59,6 +90,7 @@ Write-Host "Ensuring Ollama model '$Model' is available..."
 
 Write-Host ""
 Write-Host "Backend + UI starting on http://127.0.0.1:8787" -ForegroundColor Green
+Write-Host "Local voice: Piper $Voice" -ForegroundColor Green
 Write-Host "In NVIDIA Brev expose/tunnel port 8787 and open that HTTPS URL in the Tesla browser." -ForegroundColor Green
 Write-Host "Stop with Ctrl+C." -ForegroundColor DarkGray
 
