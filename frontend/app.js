@@ -186,7 +186,7 @@
 
   function chooseDutchVoice() {
     if (!('speechSynthesis' in window)) return null;
-    const voices = speechSynthesis.getVoices();
+    const voices = window.speechSynthesis.getVoices();
     return voices.find(v => /^nl(-|_)/i.test(v.lang)) || voices.find(v => /^nl/i.test(v.lang)) || null;
   }
 
@@ -199,7 +199,7 @@
       }
       speaking = true;
       setStatus('Praat…', 'speaking');
-      speechSynthesis.cancel();
+      window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.lang = 'nl-NL';
       const voice = chooseDutchVoice();
@@ -213,7 +213,7 @@
         resumeListening();
         resolve();
       };
-      speechSynthesis.speak(utterance);
+      window.speechSynthesis.speak(utterance);
     });
   }
 
@@ -284,7 +284,7 @@
     running = false;
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
-    speechSynthesis?.cancel?.();
+    window.speechSynthesis?.cancel?.();
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
     mediaRecorder = null;
     stream?.getTracks().forEach(track => track.stop());
