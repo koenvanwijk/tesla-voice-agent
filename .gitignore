@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 backend/.env
+backend/voices/
 .DS_Store
