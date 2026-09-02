@@ -15,6 +15,7 @@
   let analyser = null;
   let analyserData = null;
   let mediaRecorder = null;
+  let currentAudioSource = null;
   let chunks = [];
   let running = false;
   let speaking = false;
@@ -144,10 +145,54 @@
   function resumeListening() {
     processing = false;
     speaking = false;
+    currentAudioSource = null;
     speechStart = 0;
     lastLoudAt = 0;
     loudSince = 0;
     if (running) setStatus('Luistert', 'listening');
+  }
+
+  function base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
+
+  async function playLocalSpeech(audioB64) {
+    if (!audioB64) {
+      resumeListening();
+      return;
+    }
+    if (!audioContext) throw new Error('Audio-context is niet actief.');
+
+    speaking = true;
+    setStatus('Praat…', 'speaking');
+
+    if (audioContext.state !== 'running') await audioContext.resume();
+
+    const wavBuffer = base64ToArrayBuffer(audioB64);
+    const decoded = await audioContext.decodeAudioData(wavBuffer.slice(0));
+
+    await new Promise((resolve, reject) => {
+      const source = audioContext.createBufferSource();
+      currentAudioSource = source;
+      source.buffer = decoded;
+      source.connect(audioContext.destination);
+      source.onended = () => {
+        if (currentAudioSource === source) currentAudioSource = null;
+        resolve();
+      };
+      try {
+        source.start(0);
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    resumeListening();
   }
 
   async function submitTurn(blob) {
@@ -174,47 +219,21 @@
         processing = false;
         return;
       }
+
       addMessage('user', data.transcript, `spraak ${data.stt_ms} ms`);
-      addMessage('assistant', data.reply, `LLM ${data.llm_ms} ms · totaal ${data.total_ms} ms`);
-      await speak(data.reply);
+      addMessage(
+        'assistant',
+        data.reply,
+        `LLM ${data.llm_ms} ms · TTS ${data.tts_ms ?? 0} ms · totaal ${data.total_ms} ms`,
+      );
+
+      await playLocalSpeech(data.audio_b64);
     } catch (error) {
       addMessage('assistant', `Fout: ${error.message}`);
       setStatus(`Fout: ${error.message}`, 'error');
       processing = false;
+      speaking = false;
     }
-  }
-
-  function chooseDutchVoice() {
-    if (!('speechSynthesis' in window)) return null;
-    const voices = window.speechSynthesis.getVoices();
-    return voices.find(v => /^nl(-|_)/i.test(v.lang)) || voices.find(v => /^nl/i.test(v.lang)) || null;
-  }
-
-  function speak(text) {
-    return new Promise(resolve => {
-      if (!text || !('speechSynthesis' in window)) {
-        resumeListening();
-        resolve();
-        return;
-      }
-      speaking = true;
-      setStatus('Praat…', 'speaking');
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'nl-NL';
-      const voice = chooseDutchVoice();
-      if (voice) utterance.voice = voice;
-      utterance.rate = 1.02;
-      utterance.onend = () => {
-        resumeListening();
-        resolve();
-      };
-      utterance.onerror = () => {
-        resumeListening();
-        resolve();
-      };
-      window.speechSynthesis.speak(utterance);
-    });
   }
 
   function monitor() {
@@ -264,8 +283,10 @@
         channelCount: 1,
       },
     });
+
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     await audioContext.resume();
+
     const source = audioContext.createMediaStreamSource(stream);
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
@@ -284,14 +305,24 @@
     running = false;
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
-    window.speechSynthesis?.cancel?.();
+
+    if (currentAudioSource) {
+      try {
+        currentAudioSource.stop();
+      } catch {}
+      currentAudioSource = null;
+    }
+
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
     mediaRecorder = null;
     stream?.getTracks().forEach(track => track.stop());
     stream = null;
+
     if (audioContext) await audioContext.close().catch(() => {});
     audioContext = null;
     analyser = null;
+    speaking = false;
+    processing = false;
     meterFill.style.width = '0%';
     mainButton.textContent = 'START';
     mainButton.classList.remove('active');
