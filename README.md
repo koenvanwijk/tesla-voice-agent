@@ -8,11 +8,12 @@ No OpenAI API or other cloud AI API is required.
 
 Recommended setup:
 
-`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> laptop:8787 -> faster-whisper -> Ollama -> browser speech synthesis`
+`Tesla browser -> NVIDIA Brev Secure Link/Tunnel -> laptop:8787 -> faster-whisper -> Ollama -> Piper TTS -> Tesla Web Audio`
 
 - **Speech-to-text:** `faster-whisper`, local on the laptop
 - **LLM:** Ollama, local on the laptop
-- **Speech output:** Web Speech synthesis in the Tesla browser
+- **Speech output:** Piper TTS, local on the laptop
+- **Playback:** Web Audio in the Tesla browser
 - **Ingress/auth:** NVIDIA Brev Secure Link/Tunnel
 - **Frontend:** served by the laptop for normal use; also deployed to GitHub Pages for testing/launcher use
 
@@ -34,16 +35,24 @@ cd tesla-voice-agent
 powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
 ```
 
+If you already cloned an earlier version:
+
+```powershell
+git pull
+powershell -ExecutionPolicy Bypass -File .\start-windows.ps1
+```
+
 The script will:
 
 1. create `.venv`
-2. install the Python dependencies
+2. install the Python dependencies, including Piper
 3. copy `backend/.env.example` to `backend/.env` on first run
-4. start Ollama if necessary
-5. pull the configured Ollama model (`qwen3:4b` by default)
-6. start the UI + API at `http://127.0.0.1:8787`
+4. download the configured Dutch Piper voice (`nl_NL-pim-medium` by default)
+5. start Ollama if necessary
+6. pull the configured Ollama model (`qwen3:4b` by default)
+7. start the UI + API at `http://127.0.0.1:8787`
 
-The first run also downloads the configured Whisper model.
+The first voice turn also downloads the configured Whisper model if it is not cached yet.
 
 ## Expose through NVIDIA Brev
 
@@ -61,7 +70,8 @@ Open that HTTPS URL directly in the Tesla browser. This is the recommended produ
 4. Allow microphone access.
 5. Talk normally.
 6. Roughly 0.9 seconds of silence ends the turn automatically.
-7. The laptop transcribes and answers locally; the Tesla browser speaks the result.
+7. The laptop transcribes, answers and synthesizes the Dutch voice locally.
+8. The Tesla plays the returned WAV through its already-activated Web Audio context and then starts listening again.
 
 The client requests browser echo cancellation, noise suppression and auto gain control and adapts its voice threshold to ambient cabin noise.
 
@@ -72,12 +82,23 @@ Edit `backend/.env`:
 ```dotenv
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:4b
+
 WHISPER_MODEL=small
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
+
+PIPER_VOICE=nl_NL-pim-medium
+PIPER_VOICE_DIR=backend/voices
+PIPER_LENGTH_SCALE=0.95
+PIPER_NOISE_SCALE=0.667
+PIPER_NOISE_W_SCALE=0.8
+PIPER_USE_CUDA=0
+
 VOICE_AGENT_TOKEN=
 SERVE_FRONTEND=1
 ```
+
+`PIPER_LENGTH_SCALE` controls speaking speed: lower is faster. Piper runs on CPU by default so Ollama can keep the GPU for the LLM.
 
 For an NVIDIA GPU with a compatible CTranslate2 installation you can experiment with:
 
@@ -86,7 +107,7 @@ WHISPER_DEVICE=cuda
 WHISPER_COMPUTE_TYPE=float16
 ```
 
-The default CPU/int8 configuration is intentionally portable.
+The default CPU/int8 Whisper + CPU Piper configuration is intentionally portable and avoids GPU contention with Ollama.
 
 ### Optional second authentication layer
 
@@ -118,6 +139,8 @@ If GitHub Pages has not yet been enabled for the repository, go to **Settings ->
 GET /health
 ```
 
+The response includes Ollama, Whisper and Piper state. A healthy local voice setup reports `piper_ready: true`.
+
 ### Voice turn
 
 ```http
@@ -128,28 +151,33 @@ X-Session-ID: <conversation-id>
 
 Form field: `audio` (`webm` or `ogg` from MediaRecorder).
 
-Example response:
+Example response (audio shortened here):
 
 ```json
 {
   "session_id": "...",
   "transcript": "Wat staat er vandaag op de planning?",
   "reply": "...",
+  "audio_b64": "UklGR...",
+  "audio_mime": "audio/wav",
   "stt_ms": 530,
   "llm_ms": 410,
-  "total_ms": 945
+  "tts_ms": 115,
+  "total_ms": 1060
 }
 ```
 
 ## Why this stack?
 
-This first version deliberately uses a pipeline rather than an end-to-end speech model:
+This version deliberately uses a modular local pipeline rather than a cloud or end-to-end speech model:
 
 - no AI cloud dependency
+- Dutch STT and TTS both run locally
 - easy to debug
 - models are replaceable independently
 - Ollama gives many local model choices
 - faster-whisper is reliable for Dutch
+- Piper has native Dutch (`nl_NL`) voices and is lightweight enough to run beside Ollama
 - Brev gives a secure route to the laptop
 
-Later upgrades can replace browser TTS with Piper/Kokoro, add streaming STT/TTS, or switch Ollama to a local vLLM/llama.cpp/OpenAI-compatible endpoint without changing the Tesla UI substantially.
+A next latency upgrade can stream LLM tokens into Piper sentence-by-sentence instead of waiting for the entire answer before speech synthesis starts.
