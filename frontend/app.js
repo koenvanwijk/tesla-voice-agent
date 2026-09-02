@@ -17,6 +17,9 @@
   let mediaRecorder = null;
   let currentAudioSource = null;
   let chunks = [];
+  let audioQueue = [];
+  let audioDrainRunning = false;
+  let turnStreamDone = false;
   let running = false;
   let speaking = false;
   let processing = false;
@@ -128,6 +131,7 @@
       mediaRecorder = null;
       const blob = new Blob(chunks, { type: recorder?.mimeType || 'audio/webm' });
       chunks = [];
+      if (!running) return;
       if (blob.size > 800) await submitTurn(blob);
       else resumeListening();
     };
@@ -146,6 +150,9 @@
     processing = false;
     speaking = false;
     currentAudioSource = null;
+    audioQueue = [];
+    audioDrainRunning = false;
+    turnStreamDone = false;
     speechStart = 0;
     lastLoudAt = 0;
     loudSince = 0;
@@ -161,16 +168,8 @@
     return bytes.buffer;
   }
 
-  async function playLocalSpeech(audioB64) {
-    if (!audioB64) {
-      resumeListening();
-      return;
-    }
+  async function playAudioChunk(audioB64) {
     if (!audioContext) throw new Error('Audio-context is niet actief.');
-
-    speaking = true;
-    setStatus('Praat…', 'speaking');
-
     if (audioContext.state !== 'running') await audioContext.resume();
 
     const wavBuffer = base64ToArrayBuffer(audioB64);
@@ -191,19 +190,79 @@
         reject(error);
       }
     });
+  }
 
+  function finishTurnIfReady() {
+    if (!processing || !turnStreamDone || audioDrainRunning || audioQueue.length) return;
     resumeListening();
+  }
+
+  async function drainAudioQueue() {
+    if (audioDrainRunning || !processing) return;
+    audioDrainRunning = true;
+
+    try {
+      while (audioQueue.length && processing && running) {
+        speaking = true;
+        setStatus('Praat…', 'speaking');
+        const audioB64 = audioQueue.shift();
+        await playAudioChunk(audioB64);
+      }
+    } catch (error) {
+      failTurn(error);
+      return;
+    } finally {
+      audioDrainRunning = false;
+    }
+
+    speaking = false;
+    if (processing && !turnStreamDone) {
+      setStatus('Denkt verder…', 'processing');
+    }
+    finishTurnIfReady();
+  }
+
+  function enqueueAudio(audioB64) {
+    if (!audioB64 || !processing) return;
+    audioQueue.push(audioB64);
+    void drainAudioQueue();
+  }
+
+  function failTurn(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    audioQueue = [];
+    turnStreamDone = true;
+    processing = false;
+    speaking = false;
+
+    if (currentAudioSource) {
+      try {
+        currentAudioSource.stop();
+      } catch {}
+      currentAudioSource = null;
+    }
+
+    addMessage('assistant', `Fout: ${message}`);
+    setStatus(`Fout: ${message}`, 'error');
   }
 
   async function submitTurn(blob) {
     processing = true;
+    speaking = false;
+    turnStreamDone = false;
+    audioQueue = [];
     setStatus('Denkt…', 'processing');
+
     const form = new FormData();
     const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
     form.append('audio', blob, `turn.${ext}`);
 
+    let transcriptAdded = false;
+    let replyText = '';
+    let sawDone = false;
+
     try {
-      const response = await fetch(backendUrl('/api/turn'), {
+      const response = await fetch(backendUrl('/api/stream-turn'), {
         method: 'POST',
         headers: {
           ...authHeaders(),
@@ -211,28 +270,90 @@
         },
         body: form,
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
-      if (data.session_id) sessionId = data.session_id;
-      if (!data.transcript) {
-        setStatus('Niets verstaan — luister opnieuw', 'listening');
-        processing = false;
-        return;
+
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+          const data = await response.json();
+          detail = data.detail || detail;
+        } catch {}
+        throw new Error(detail);
       }
 
-      addMessage('user', data.transcript, `spraak ${data.stt_ms} ms`);
-      addMessage(
-        'assistant',
-        data.reply,
-        `LLM ${data.llm_ms} ms · TTS ${data.tts_ms ?? 0} ms · totaal ${data.total_ms} ms`,
-      );
+      if (!response.body) throw new Error('Streaming response wordt niet ondersteund.');
 
-      await playLocalSpeech(data.audio_b64);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = '';
+
+      const handleEvent = event => {
+        if (event.type === 'transcript') {
+          if (event.session_id) sessionId = event.session_id;
+          if (event.text && !transcriptAdded) {
+            addMessage('user', event.text, `spraak ${event.stt_ms} ms`);
+            transcriptAdded = true;
+          }
+          return;
+        }
+
+        if (event.type === 'text') {
+          replyText += event.delta || '';
+          return;
+        }
+
+        if (event.type === 'audio') {
+          enqueueAudio(event.audio_b64);
+          return;
+        }
+
+        if (event.type === 'error') {
+          throw new Error(event.message || 'Onbekende streamingfout');
+        }
+
+        if (event.type === 'done') {
+          sawDone = true;
+          if (event.session_id) sessionId = event.session_id;
+
+          if (!event.transcript) {
+            turnStreamDone = true;
+            setStatus('Niets verstaan — luister opnieuw', 'listening');
+            finishTurnIfReady();
+            return;
+          }
+
+          const reply = event.reply || replyText.trim();
+          addMessage(
+            'assistant',
+            reply,
+            `LLM ${event.llm_ms ?? 0} ms · TTS ${event.tts_ms ?? 0} ms · eerste audio ${event.first_audio_ms ?? 0} ms · totaal ${event.total_ms ?? 0} ms`,
+          );
+          turnStreamDone = true;
+          finishTurnIfReady();
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split('\n');
+        pending = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          handleEvent(JSON.parse(line));
+        }
+      }
+
+      pending += decoder.decode();
+      if (pending.trim()) handleEvent(JSON.parse(pending));
+
+      if (!sawDone && processing) {
+        throw new Error('De streamingverbinding stopte vóór het antwoord klaar was.');
+      }
     } catch (error) {
-      addMessage('assistant', `Fout: ${error.message}`);
-      setStatus(`Fout: ${error.message}`, 'error');
-      processing = false;
-      speaking = false;
+      failTurn(error);
     }
   }
 
@@ -305,6 +426,8 @@
     running = false;
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
+    audioQueue = [];
+    turnStreamDone = true;
 
     if (currentAudioSource) {
       try {
@@ -323,6 +446,7 @@
     analyser = null;
     speaking = false;
     processing = false;
+    audioDrainRunning = false;
     meterFill.style.width = '0%';
     mainButton.textContent = 'START';
     mainButton.classList.remove('active');
