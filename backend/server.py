@@ -26,6 +26,23 @@ FRONTEND = ROOT / "frontend"
 TOKEN = os.getenv("VOICE_AGENT_TOKEN", "").strip()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+# Optional OpenAI-compatible backend (e.g. the DGX Spark deepseek endpoint).
+# Set LLM_BACKEND=openai (or just OPENAI_BASE_URL) to route chat to /v1/chat/completions.
+LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama").strip().lower()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# Extra JSON merged into the OpenAI chat payload, e.g. to disable Qwen thinking:
+#   OPENAI_EXTRA_BODY={"chat_template_kwargs":{"enable_thinking":false}}
+OPENAI_EXTRA_BODY = os.getenv("OPENAI_EXTRA_BODY", "").strip()
+USE_OPENAI = LLM_BACKEND in ("openai", "vllm", "llamacpp") or bool(OPENAI_BASE_URL)
+LLM_MODEL = (OPENAI_MODEL or OLLAMA_MODEL) if USE_OPENAI else OLLAMA_MODEL
+try:
+    _EXTRA_BODY = json.loads(OPENAI_EXTRA_BODY) if OPENAI_EXTRA_BODY else {}
+    if not isinstance(_EXTRA_BODY, dict):
+        _EXTRA_BODY = {}
+except json.JSONDecodeError:
+    _EXTRA_BODY = {}
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -184,31 +201,93 @@ def remember_turn(session_id: str, user_text: str, reply: str) -> None:
     _histories[session_id].append({"role": "assistant", "content": reply})
 
 
-async def ask_ollama(session_id: str, user_text: str) -> str:
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": build_messages(session_id, user_text),
-        "stream": False,
+def _llm_chat_url() -> str:
+    return f"{OPENAI_BASE_URL}/chat/completions" if USE_OPENAI else f"{OLLAMA_URL}/api/chat"
+
+
+def _llm_models_url() -> str:
+    return f"{OPENAI_BASE_URL}/models" if USE_OPENAI else f"{OLLAMA_URL}/api/tags"
+
+
+def _llm_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}"} if (USE_OPENAI and OPENAI_API_KEY) else {}
+
+
+def _llm_payload(messages: list[dict[str, str]], stream: bool) -> dict:
+    if USE_OPENAI:
+        body = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "stream": stream,
+            "temperature": 0.35,
+            "max_tokens": 220,
+        }
+        body.update(_EXTRA_BODY)
+        return body
+    return {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "stream": stream,
         "think": False,
         "options": {"temperature": 0.35, "num_predict": 220},
     }
 
+
+def _stream_delta(line: str) -> tuple[str, bool, str | None]:
+    """Parse one streamed line into (delta_text, done, error).
+
+    Handles Ollama JSONL ({"message":{"content":...},"done":...}) and OpenAI
+    SSE ("data: {choices:[{delta:{content}}]}" ... "data: [DONE]").
+    """
+    if not line:
+        return "", False, None
+    if USE_OPENAI:
+        if not line.startswith("data:"):
+            return "", False, None
+        body = line[len("data:"):].strip()
+        if body == "[DONE]":
+            return "", True, None
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return "", False, None
+        if data.get("error"):
+            return "", False, str(data["error"])
+        choice = (data.get("choices") or [{}])[0]
+        delta = (choice.get("delta") or {}).get("content") or ""
+        return delta, choice.get("finish_reason") is not None, None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return "", False, None
+    if data.get("error"):
+        return "", False, str(data["error"])
+    delta = (data.get("message") or {}).get("content", "") or ""
+    return delta, bool(data.get("done")), None
+
+
+async def ask_ollama(session_id: str, user_text: str) -> str:
+    payload = _llm_payload(build_messages(session_id, user_text), stream=False)
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
-            response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+            response = await client.post(_llm_chat_url(), json=payload, headers=_llm_headers())
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Cannot reach Ollama: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Cannot reach LLM: {exc}") from exc
 
     if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
-            detail=f"Ollama returned {response.status_code}: {response.text[:300]}",
+            detail=f"LLM returned {response.status_code}: {response.text[:300]}",
         )
 
     data = response.json()
-    reply = (data.get("message") or {}).get("content", "").strip()
+    if USE_OPENAI:
+        reply = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+    else:
+        reply = (data.get("message") or {}).get("content", "").strip()
     if not reply:
-        raise HTTPException(status_code=502, detail="Ollama returned an empty reply")
+        raise HTTPException(status_code=502, detail="LLM returned an empty reply")
 
     remember_turn(session_id, user_text, reply)
     return reply
@@ -250,10 +329,14 @@ async def health():
     installed_models = []
     try:
         async with httpx.AsyncClient(timeout=2.5) as client:
-            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response = await client.get(_llm_models_url(), headers=_llm_headers())
         if response.is_success:
             ollama_ok = True
-            installed_models = [m.get("name") for m in response.json().get("models", [])]
+            body = response.json()
+            if USE_OPENAI:
+                installed_models = [m.get("id") for m in body.get("data", [])]
+            else:
+                installed_models = [m.get("name") for m in body.get("models", [])]
     except Exception:
         pass
 
@@ -263,9 +346,11 @@ async def health():
     return {
         "ok": True,
         "ollama": ollama_ok,
-        "ollama_model": OLLAMA_MODEL,
+        "llm_backend": "openai" if USE_OPENAI else "ollama",
+        "llm_url": _llm_chat_url(),
+        "ollama_model": LLM_MODEL,
         "model_installed": any(
-            name == OLLAMA_MODEL or (name or "").startswith(f"{OLLAMA_MODEL}:")
+            name == LLM_MODEL or (name or "").startswith(f"{LLM_MODEL}:")
             for name in installed_models
         ),
         "whisper_model": WHISPER_MODEL,
@@ -323,34 +408,25 @@ async def stream_turn(
             "stt_ms": stt_ms,
         })
 
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": build_messages(session_id, transcript),
-            "stream": True,
-            "think": False,
-            "options": {"temperature": 0.35, "num_predict": 220},
-        }
+        payload = _llm_payload(build_messages(session_id, transcript), stream=True)
 
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
-                async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as response:
+                async with client.stream("POST", _llm_chat_url(), json=payload, headers=_llm_headers()) as response:
                     if response.status_code >= 400:
                         detail = (await response.aread()).decode("utf-8", errors="replace")[:300]
                         yield ndjson_event({
                             "type": "error",
-                            "message": f"Ollama returned {response.status_code}: {detail}",
+                            "message": f"LLM returned {response.status_code}: {detail}",
                         })
                         return
 
                     async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        data = json.loads(line)
-                        if data.get("error"):
-                            yield ndjson_event({"type": "error", "message": str(data["error"])})
+                        delta, done, err = _stream_delta(line)
+                        if err:
+                            yield ndjson_event({"type": "error", "message": err})
                             return
 
-                        delta = (data.get("message") or {}).get("content", "")
                         if delta:
                             reply_parts.append(delta)
                             speech_buffer += delta
@@ -374,7 +450,7 @@ async def stream_turn(
                                 "tts_ms": chunk_tts_ms,
                             })
 
-                        if data.get("done"):
+                        if done:
                             break
 
             sentence, speech_buffer = pop_speakable_chunk(speech_buffer, force=True)
