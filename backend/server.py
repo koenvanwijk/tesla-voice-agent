@@ -102,6 +102,9 @@ _piper_voices: dict = {}
 _whisper_lock = asyncio.Lock()
 _piper_lock = asyncio.Lock()
 _histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
+# Per voice-session continuity for the Claude agent: voice session id -> the
+# Claude Code session id learned from the last reply (so the next turn resumes).
+_claude_threads: dict[str, str] = {}
 
 
 def require_token(authorization: str | None) -> None:
@@ -405,39 +408,86 @@ def _deep_find(obj, keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def _agent_command(agent_id: str, session_id: str, user_text: str) -> list[str]:
+def _claude_session_cwd(claude_session_id: str) -> str:
+    """The cwd a Claude session was recorded under, so --resume finds it."""
+    for jsonl in Path.home().glob(f".claude/projects/*/{claude_session_id}.jsonl"):
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    rec = json.loads(line)
+                    cwd = rec.get("cwd")
+                    if isinstance(cwd, str) and cwd:
+                        return cwd
+        except (OSError, json.JSONDecodeError):
+            continue
+        break
+    return str(Path.home())
+
+
+def _build_agent_call(
+    agent_id: str, session_id: str, user_text: str, conversation: str
+) -> tuple[list[str], str, str]:
+    """Return (argv, cwd, conversation_token) for a coding-agent turn."""
+    conversation = (conversation or "").strip()
     if agent_id == "claude":
         cmd = [CLAUDE_BIN, "-p", user_text, "--output-format", "json",
                "--append-system-prompt", SYSTEM_PROMPT]
         if CLAUDE_MODEL:
             cmd += ["--model", CLAUDE_MODEL]
-        return cmd
+        resume_id = conversation or _claude_threads.get(session_id, "")
+        cwd = str(Path.home())
+        if resume_id:
+            cmd += ["--resume", resume_id]
+            cwd = _claude_session_cwd(resume_id)
+        return cmd, cwd, resume_id
     if agent_id == "openclaw":
-        return [OPENCLAW_BIN, "agent", "-m", user_text, "--json",
-                "--session-id", f"tva-{session_id}"[:128]]
+        cmd = [OPENCLAW_BIN, "agent", "-m", user_text, "--json"]
+        if conversation.startswith("discord:"):
+            target = conversation.split(":", 1)[1]
+            # Use the channel's conversation context; do not --deliver (no post).
+            cmd += ["--channel", "discord", "--to", target]
+            token = conversation
+        elif conversation.startswith("session:"):
+            sid = conversation.split(":", 1)[1] or f"tva-{session_id}"
+            cmd += ["--session-id", sid[:128]]
+            token = f"session:{sid}"
+        elif conversation:
+            cmd += ["--session-id", conversation[:128]]
+            token = f"session:{conversation}"
+        else:
+            sid = f"tva-{session_id}"
+            cmd += ["--session-id", sid[:128]]
+            token = f"session:{sid}"
+        return cmd, str(Path.home()), token
     raise HTTPException(status_code=400, detail=f"Unknown agent '{agent_id}'")
 
 
-def _parse_agent_reply(agent_id: str, stdout: str) -> str:
+def _parse_agent_reply(agent_id: str, stdout: str) -> tuple[str, str | None]:
+    """Return (reply_text, conversation_id_from_output)."""
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         text = stdout.strip()  # some CLIs print plain text instead of JSON
         if text:
-            return text
+            return text, None
         raise HTTPException(status_code=502, detail=f"{agent_id} returned no output")
     if agent_id == "claude":
         reply = (data.get("result") if isinstance(data, dict) else "") or ""
+        conv = data.get("session_id") if isinstance(data, dict) else None
     else:  # openclaw
         reply = _deep_find(data, ("finalAssistantVisibleText", "finalAssistantRawText")) or ""
+        conv = None
     reply = reply.strip()
     if not reply:
         raise HTTPException(status_code=502, detail=f"{agent_id} returned an empty reply")
-    return reply
+    return reply, conv
 
 
-async def run_cli_agent(agent_id: str, session_id: str, user_text: str) -> str:
-    cmd = _agent_command(agent_id, session_id, user_text)
+async def run_cli_agent(
+    agent_id: str, session_id: str, user_text: str, conversation: str = ""
+) -> tuple[str, str]:
+    """Run one agent turn. Returns (reply, conversation_token) for continuity."""
+    cmd, cwd, token = _build_agent_call(agent_id, session_id, user_text, conversation)
     env = {**os.environ, "PATH": _agent_path()}
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -445,7 +495,7 @@ async def run_cli_agent(agent_id: str, session_id: str, user_text: str) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
-            cwd=str(Path.home()),
+            cwd=cwd,
         )
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=AGENT_TIMEOUT
@@ -459,16 +509,121 @@ async def run_cli_agent(agent_id: str, session_id: str, user_text: str) -> str:
         err = (stderr_b or stdout_b).decode("utf-8", errors="replace").strip()[:300]
         raise HTTPException(status_code=502, detail=f"Agent '{agent_id}' failed ({proc.returncode}): {err}")
 
-    reply = _parse_agent_reply(agent_id, stdout_b.decode("utf-8", errors="replace"))
+    reply, out_conv = _parse_agent_reply(agent_id, stdout_b.decode("utf-8", errors="replace"))
+    if agent_id == "claude":
+        token = out_conv or token
+        if token:
+            _claude_threads[session_id] = token  # remember for the next turn
     remember_turn(session_id, user_text, reply)
-    return reply
+    return reply, token
 
 
-async def agent_event_stream(agent_id, session_id, transcript, voice_id, request_started, stt_ms):
+async def _run_capture(cmd: list[str], timeout: float = 30.0) -> tuple[int, str, str]:
+    env = {**os.environ, "PATH": _agent_path()}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=env, cwd=str(Path.home()),
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (FileNotFoundError, asyncio.TimeoutError):
+        return 124, "", "unavailable"
+    return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def _claude_session_label(jsonl: Path) -> str:
+    try:
+        with jsonl.open("r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 40:
+                    break
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message")
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = " ".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    else:
+                        text = ""
+                    text = " ".join(text.split()).strip()
+                    if text:
+                        return text[:80]
+    except OSError:
+        pass
+    return ""
+
+
+def list_claude_sessions(limit: int = 25) -> list[dict]:
+    root = Path.home() / ".claude" / "projects"
+    if not root.exists():
+        return []
+    files = sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for jsonl in files[:limit]:
+        out.append({
+            "id": jsonl.stem,
+            "label": _claude_session_label(jsonl) or jsonl.stem[:8],
+            "kind": "session",
+            "updated": int(jsonl.stat().st_mtime * 1000),
+        })
+    return out
+
+
+async def list_openclaw_conversations(limit: int = 25) -> list[dict]:
+    out: list[dict] = []
+    rc, so, _ = await _run_capture(
+        [OPENCLAW_BIN, "sessions", "--json", "--limit", str(limit)]
+    )
+    if rc == 0:
+        try:
+            for s in (json.loads(so) or {}).get("sessions", []):
+                sid = s.get("sessionId") or s.get("key")
+                if not sid:
+                    continue
+                label = " · ".join(x for x in (s.get("model"), s.get("key")) if x)
+                out.append({
+                    "id": f"session:{sid}",
+                    "label": label[:80] or str(sid),
+                    "kind": "session",
+                    "updated": int(s.get("updatedAt") or 0),
+                })
+        except json.JSONDecodeError:
+            pass
+    rc, so, _ = await _run_capture(
+        [OPENCLAW_BIN, "directory", "groups", "list", "--channel", "discord", "--json"]
+    )
+    if rc == 0:
+        try:
+            groups = json.loads(so)
+            for g in groups if isinstance(groups, list) else []:
+                raw = g.get("raw") or {}
+                if raw.get("type") != 0:  # only text channels are messageable
+                    continue
+                cid = raw.get("id") or g.get("id", "").split(":", 1)[-1]
+                out.append({
+                    "id": f"discord:{cid}",
+                    "label": g.get("handle") or ("#" + str(g.get("name", cid))),
+                    "kind": "discord",
+                    "updated": 0,
+                })
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+async def agent_event_stream(agent_id, session_id, transcript, voice_id, request_started, stt_ms, conversation=""):
     """NDJSON events for a coding-agent turn: full reply, then progressive TTS."""
     agent_started = time.perf_counter()
     try:
-        reply = await run_cli_agent(agent_id, session_id, transcript)
+        reply, conversation = await run_cli_agent(agent_id, session_id, transcript, conversation)
     except HTTPException as exc:
         yield ndjson_event({"type": "error", "message": str(exc.detail)})
         return
@@ -509,6 +664,7 @@ async def agent_event_stream(agent_id, session_id, transcript, voice_id, request
         "session_id": session_id,
         "transcript": transcript,
         "reply": reply,
+        "conversation": conversation,
         "stt_ms": stt_ms,
         "llm_ms": agent_ms,
         "tts_ms": tts_ms_total,
@@ -607,11 +763,22 @@ async def agents():
     return {"default": "llm", "agents": available_agents()}
 
 
+@app.get("/conversations")
+async def conversations(agent: str = "llm"):
+    agent_id = resolve_agent(agent)
+    if agent_id == "claude":
+        return {"agent": "claude", "conversations": list_claude_sessions()}
+    if agent_id == "openclaw":
+        return {"agent": "openclaw", "conversations": await list_openclaw_conversations()}
+    return {"agent": agent_id, "conversations": []}
+
+
 @app.post("/api/stream-turn")
 async def stream_turn(
     audio: UploadFile = File(...),
     voice: str = Form(default=""),
     agent: str = Form(default=""),
+    conversation: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -658,7 +825,7 @@ async def stream_turn(
 
         if agent_id != "llm":
             async for ev in agent_event_stream(
-                agent_id, session_id, transcript, voice_id, request_started, stt_ms
+                agent_id, session_id, transcript, voice_id, request_started, stt_ms, conversation
             ):
                 yield ev
             return
@@ -759,6 +926,7 @@ async def turn(
     audio: UploadFile = File(...),
     voice: str = Form(default=""),
     agent: str = Form(default=""),
+    conversation: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -784,10 +952,11 @@ async def turn(
         }
 
     t1 = time.perf_counter()
+    conversation_out = ""
     if agent_id == "llm":
         reply = await ask_ollama(session_id, transcript)
     else:
-        reply = await run_cli_agent(agent_id, session_id, transcript)
+        reply, conversation_out = await run_cli_agent(agent_id, session_id, transcript, conversation)
     llm_ms = round((time.perf_counter() - t1) * 1000)
 
     try:
@@ -802,6 +971,7 @@ async def turn(
         "session_id": session_id,
         "transcript": transcript,
         "reply": reply,
+        "conversation": conversation_out,
         "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
         "audio_mime": "audio/wav",
         "stt_ms": stt_ms,

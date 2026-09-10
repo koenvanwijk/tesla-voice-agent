@@ -11,6 +11,7 @@
   const healthResult = document.getElementById('healthResult');
   const voiceSelect = document.getElementById('voiceSelect');
   const agentSelect = document.getElementById('agentSelect');
+  const conversationSelect = document.getElementById('conversationSelect');
 
   let stream = null;
   let audioContext = null;
@@ -110,6 +111,28 @@
         agentSelect.append(opt);
       }
       if ([...agentSelect.options].some(o => o.value === saved && !o.disabled)) agentSelect.value = saved;
+    } catch {}
+    loadConversations();
+  }
+
+  async function loadConversations() {
+    const base = backendUrlInput.value.trim().replace(/\/$/, '');
+    const agent = agentSelect.value || 'llm';
+    conversationSelect.innerHTML = '<option value="">nieuw / auto</option>';
+    if (!base || agent === 'llm') return;
+    try {
+      const response = await fetch(`${base}/conversations?agent=${encodeURIComponent(agent)}`, { headers: authHeaders() });
+      if (!response.ok) return;
+      const data = await response.json();
+      const saved = localStorage.getItem('tva-conv-' + agent) || '';
+      for (const c of data.conversations || []) {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        const tag = c.kind === 'discord' ? '💬 ' : '🧵 ';
+        opt.textContent = tag + (c.label || c.id);
+        conversationSelect.append(opt);
+      }
+      if ([...conversationSelect.options].some(o => o.value === saved)) conversationSelect.value = saved;
     } catch {}
   }
 
@@ -303,6 +326,7 @@
     form.append('audio', blob, `turn.${ext}`);
     if (voiceSelect.value) form.append('voice', voiceSelect.value);
     if (agentSelect.value) form.append('agent', agentSelect.value);
+    if (conversationSelect.value) form.append('conversation', conversationSelect.value);
 
     let transcriptAdded = false;
     let replyText = '';
@@ -512,7 +536,13 @@
   saveSettingsButton.addEventListener('click', saveSettings);
   testBackendButton.addEventListener('click', testBackend);
   voiceSelect.addEventListener('change', () => localStorage.setItem('tva-voice', voiceSelect.value));
-  agentSelect.addEventListener('change', () => localStorage.setItem('tva-agent', agentSelect.value));
+  agentSelect.addEventListener('change', () => {
+    localStorage.setItem('tva-agent', agentSelect.value);
+    loadConversations();
+  });
+  conversationSelect.addEventListener('change', () => {
+    localStorage.setItem('tva-conv-' + (agentSelect.value || 'llm'), conversationSelect.value);
+  });
   loadVoices();
   loadAgents();
 
