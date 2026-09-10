@@ -201,6 +201,13 @@ def synthesize_wav(text: str, voice_id: str | None = None) -> bytes:
     return wav_io.getvalue()
 
 
+async def resolve_turn_input(audio: UploadFile | None, text: str) -> tuple[str, int]:
+    """Turn input from either a voice upload (STT) or typed text (stt_ms=0)."""
+    if audio is not None and audio.filename:
+        return await transcribe_upload(audio)
+    return (text or "").strip(), 0
+
+
 async def transcribe_upload(audio: UploadFile) -> tuple[str, int]:
     raw = await audio.read(MAX_AUDIO_BYTES + 1)
     if not raw:
@@ -775,10 +782,11 @@ async def conversations(agent: str = "llm"):
 
 @app.post("/api/stream-turn")
 async def stream_turn(
-    audio: UploadFile = File(...),
+    audio: UploadFile | None = File(default=None),
     voice: str = Form(default=""),
     agent: str = Form(default=""),
     conversation: str = Form(default=""),
+    text: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -787,7 +795,7 @@ async def stream_turn(
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
     voice_id = resolve_voice(voice)
     agent_id = resolve_agent(agent)
-    transcript, stt_ms = await transcribe_upload(audio)
+    transcript, stt_ms = await resolve_turn_input(audio, text)
 
     if not transcript:
         async def empty_stream():
@@ -923,10 +931,11 @@ async def stream_turn(
 
 @app.post("/api/turn")
 async def turn(
-    audio: UploadFile = File(...),
+    audio: UploadFile | None = File(default=None),
     voice: str = Form(default=""),
     agent: str = Form(default=""),
     conversation: str = Form(default=""),
+    text: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -936,7 +945,7 @@ async def turn(
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
     voice_id = resolve_voice(voice)
     agent_id = resolve_agent(agent)
-    transcript, stt_ms = await transcribe_upload(audio)
+    transcript, stt_ms = await resolve_turn_input(audio, text)
 
     if not transcript:
         return {

@@ -12,6 +12,9 @@
   const voiceSelect = document.getElementById('voiceSelect');
   const agentSelect = document.getElementById('agentSelect');
   const conversationSelect = document.getElementById('conversationSelect');
+  const textForm = document.getElementById('textForm');
+  const textInput = document.getElementById('textInput');
+  const textSend = document.getElementById('textSend');
 
   let stream = null;
   let audioContext = null;
@@ -200,7 +203,7 @@
       const blob = new Blob(chunks, { type: recorder?.mimeType || 'audio/webm' });
       chunks = [];
       if (!running) return;
-      if (blob.size > 800) await submitTurn(blob);
+      if (blob.size > 800) await submitTurn({ blob });
       else resumeListening();
     };
     mediaRecorder.start(120);
@@ -224,7 +227,15 @@
     speechStart = 0;
     lastLoudAt = 0;
     loudSince = 0;
-    if (running) setStatus('Luistert', 'listening');
+    setStatus(running ? 'Luistert' : 'Klaar', running ? 'listening' : 'idle');
+    if (textSend) textSend.disabled = false;
+  }
+
+  async function ensureAudioContext() {
+    if (!audioContext) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioContext.state !== 'running') await audioContext.resume();
   }
 
   function base64ToArrayBuffer(base64) {
@@ -270,7 +281,7 @@
     audioDrainRunning = true;
 
     try {
-      while (audioQueue.length && processing && running) {
+      while (audioQueue.length && processing) {
         speaking = true;
         setStatus('Praat…', 'speaking');
         const audioB64 = audioQueue.shift();
@@ -312,9 +323,14 @@
 
     addMessage('assistant', `Fout: ${message}`);
     setStatus(`Fout: ${message}`, 'error');
+    if (textSend) textSend.disabled = false;
   }
 
-  async function submitTurn(blob) {
+  async function submitTurn(input) {
+    const blob = input && input.blob ? input.blob : null;
+    const typed = input && input.text ? input.text.trim() : '';
+    if (!blob && !typed) return;
+
     processing = true;
     speaking = false;
     turnStreamDone = false;
@@ -322,8 +338,12 @@
     setStatus('Denkt…', 'processing');
 
     const form = new FormData();
-    const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
-    form.append('audio', blob, `turn.${ext}`);
+    if (blob) {
+      const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
+      form.append('audio', blob, `turn.${ext}`);
+    } else {
+      form.append('text', typed);
+    }
     if (voiceSelect.value) form.append('voice', voiceSelect.value);
     if (agentSelect.value) form.append('agent', agentSelect.value);
     if (conversationSelect.value) form.append('conversation', conversationSelect.value);
@@ -331,6 +351,11 @@
     let transcriptAdded = false;
     let replyText = '';
     let sawDone = false;
+
+    if (typed) {
+      addMessage('user', typed, 'getypt');
+      transcriptAdded = true;
+    }
 
     try {
       const response = await fetch(backendUrl('/api/stream-turn'), {
@@ -542,6 +567,17 @@
   });
   conversationSelect.addEventListener('change', () => {
     localStorage.setItem('tva-conv-' + (agentSelect.value || 'llm'), conversationSelect.value);
+  });
+  textForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const value = textInput.value.trim();
+    if (!value || processing) return;
+    textInput.value = '';
+    textSend.disabled = true;
+    try {
+      await ensureAudioContext();
+    } catch {}
+    await submitTurn({ text: value });
   });
   loadVoices();
   loadAgents();

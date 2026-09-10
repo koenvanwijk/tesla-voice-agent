@@ -120,6 +120,24 @@ header p { margin: 8px 0 0; color: #a6a6ad; font-size: clamp(16px, 2vw, 22px); }
 }
 .settings pre { white-space: pre-wrap; color: #92929b; }
 
+.text-form { display: flex; gap: 10px; margin: 16px 0 4px; }
+.text-form input {
+  flex: 1;
+  padding: 14px 16px;
+  border: 1px solid #38383f;
+  border-radius: 10px;
+  background: #151519;
+  color: #fff;
+}
+.text-form button {
+  padding: 12px 18px;
+  border: 1px solid #3a3a41;
+  border-radius: 10px;
+  background: #232328;
+  color: #fff;
+}
+.text-form button:disabled { opacity: .5; cursor: default; }
+
 @media (max-width: 700px) {
   .shell { padding-left: 20px; padding-right: 20px; }
   .main-button { width: min(62vw, 280px); }
