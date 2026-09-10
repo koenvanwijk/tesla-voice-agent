@@ -10,6 +10,7 @@
   const testBackendButton = document.getElementById('testBackend');
   const healthResult = document.getElementById('healthResult');
   const voiceSelect = document.getElementById('voiceSelect');
+  const agentSelect = document.getElementById('agentSelect');
 
   let stream = null;
   let audioContext = null;
@@ -86,8 +87,30 @@
     localStorage.setItem('tva-backend-url', backendUrlInput.value.trim());
     localStorage.setItem('tva-backend-token', backendTokenInput.value.trim());
     localStorage.setItem('tva-voice', voiceSelect.value);
+    localStorage.setItem('tva-agent', agentSelect.value);
     healthResult.textContent = 'Opgeslagen.';
     loadVoices();
+    loadAgents();
+  }
+
+  async function loadAgents() {
+    const base = backendUrlInput.value.trim().replace(/\/$/, '');
+    if (!base) return;
+    try {
+      const response = await fetch(`${base}/agents`, { headers: authHeaders() });
+      if (!response.ok) return;
+      const data = await response.json();
+      const saved = localStorage.getItem('tva-agent') || data.default || 'llm';
+      agentSelect.innerHTML = '';
+      for (const a of data.agents || []) {
+        const opt = document.createElement('option');
+        opt.value = a.id;
+        opt.textContent = (a.label || a.id) + (a.available ? '' : ' (niet beschikbaar)');
+        opt.disabled = !a.available;
+        agentSelect.append(opt);
+      }
+      if ([...agentSelect.options].some(o => o.value === saved && !o.disabled)) agentSelect.value = saved;
+    } catch {}
   }
 
   async function loadVoices() {
@@ -279,6 +302,7 @@
     const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
     form.append('audio', blob, `turn.${ext}`);
     if (voiceSelect.value) form.append('voice', voiceSelect.value);
+    if (agentSelect.value) form.append('agent', agentSelect.value);
 
     let transcriptAdded = false;
     let replyText = '';
@@ -488,7 +512,9 @@
   saveSettingsButton.addEventListener('click', saveSettings);
   testBackendButton.addEventListener('click', testBackend);
   voiceSelect.addEventListener('change', () => localStorage.setItem('tva-voice', voiceSelect.value));
+  agentSelect.addEventListener('change', () => localStorage.setItem('tva-agent', agentSelect.value));
   loadVoices();
+  loadAgents();
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});

@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -43,6 +44,19 @@ try:
         _EXTRA_BODY = {}
 except json.JSONDecodeError:
     _EXTRA_BODY = {}
+
+# --- Agent backends -------------------------------------------------------
+# Besides the raw LLM, a voice turn can be routed to a coding-agent CLI
+# (Claude Code or OpenClaw). Each agent returns a full text reply which is
+# then streamed to Piper TTS just like an LLM answer.
+AGENT_TIMEOUT = float(os.getenv("AGENT_TIMEOUT", "120"))
+CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "").strip()
+OPENCLAW_BIN = os.getenv("OPENCLAW_BIN", "openclaw").strip()
+# OpenClaw needs a newer Node than some system defaults; this bin dir (if set,
+# else the newest ~/.nvm node >= v24) is prepended to PATH for agent calls.
+AGENT_NODE_BIN_DIR = os.getenv("AGENT_NODE_BIN_DIR", "").strip()
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -318,6 +332,191 @@ async def ask_ollama(session_id: str, user_text: str) -> str:
     return reply
 
 
+# --- Agent backends -------------------------------------------------------
+
+def _detect_node_bin_dir() -> str:
+    """Newest ~/.nvm node >= v24 bin dir, or AGENT_NODE_BIN_DIR if set."""
+    if AGENT_NODE_BIN_DIR:
+        return AGENT_NODE_BIN_DIR
+    best: tuple[int, ...] | None = None
+    best_dir = ""
+    for bin_dir in Path.home().glob(".nvm/versions/node/v*/bin"):
+        if not (bin_dir / "node").exists():
+            continue
+        try:
+            parts = tuple(int(p) for p in bin_dir.parent.name[1:].split("."))
+        except ValueError:
+            continue
+        if parts[0] >= 24 and (best is None or parts > best):
+            best, best_dir = parts, str(bin_dir)
+    return best_dir
+
+
+NODE_BIN_DIR = _detect_node_bin_dir()
+
+AGENT_REGISTRY: dict[str, dict] = {
+    "llm": {"label": f"LLM ({LLM_MODEL})", "bin": None},
+    "claude": {"label": "Claude", "bin": CLAUDE_BIN},
+    "openclaw": {"label": "OpenClaw", "bin": OPENCLAW_BIN},
+}
+
+
+def _agent_path() -> str:
+    path = os.environ.get("PATH", "")
+    if NODE_BIN_DIR and NODE_BIN_DIR not in path.split(os.pathsep):
+        path = NODE_BIN_DIR + os.pathsep + path
+    return path
+
+
+def agent_available(agent_id: str) -> bool:
+    spec = AGENT_REGISTRY.get(agent_id)
+    if not spec:
+        return False
+    if spec["bin"] is None:  # the built-in LLM is always available
+        return True
+    return shutil.which(spec["bin"], path=_agent_path()) is not None
+
+
+def resolve_agent(requested: str | None) -> str:
+    a = (requested or "").strip().lower()
+    return a if a in AGENT_REGISTRY and agent_available(a) else "llm"
+
+
+def available_agents() -> list[dict]:
+    return [
+        {"id": aid, "label": spec["label"], "available": agent_available(aid)}
+        for aid, spec in AGENT_REGISTRY.items()
+    ]
+
+
+def _deep_find(obj, keys: tuple[str, ...]) -> str | None:
+    """Depth-first search for the first non-empty string under any of `keys`."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k in keys:
+                v = cur.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def _agent_command(agent_id: str, session_id: str, user_text: str) -> list[str]:
+    if agent_id == "claude":
+        cmd = [CLAUDE_BIN, "-p", user_text, "--output-format", "json",
+               "--append-system-prompt", SYSTEM_PROMPT]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        return cmd
+    if agent_id == "openclaw":
+        return [OPENCLAW_BIN, "agent", "-m", user_text, "--json",
+                "--session-id", f"tva-{session_id}"[:128]]
+    raise HTTPException(status_code=400, detail=f"Unknown agent '{agent_id}'")
+
+
+def _parse_agent_reply(agent_id: str, stdout: str) -> str:
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        text = stdout.strip()  # some CLIs print plain text instead of JSON
+        if text:
+            return text
+        raise HTTPException(status_code=502, detail=f"{agent_id} returned no output")
+    if agent_id == "claude":
+        reply = (data.get("result") if isinstance(data, dict) else "") or ""
+    else:  # openclaw
+        reply = _deep_find(data, ("finalAssistantVisibleText", "finalAssistantRawText")) or ""
+    reply = reply.strip()
+    if not reply:
+        raise HTTPException(status_code=502, detail=f"{agent_id} returned an empty reply")
+    return reply
+
+
+async def run_cli_agent(agent_id: str, session_id: str, user_text: str) -> str:
+    cmd = _agent_command(agent_id, session_id, user_text)
+    env = {**os.environ, "PATH": _agent_path()}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=str(Path.home()),
+        )
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=AGENT_TIMEOUT
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=502, detail=f"Agent '{agent_id}' not installed: {exc}") from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=f"Agent '{agent_id}' timed out after {AGENT_TIMEOUT:.0f}s") from exc
+
+    if proc.returncode != 0:
+        err = (stderr_b or stdout_b).decode("utf-8", errors="replace").strip()[:300]
+        raise HTTPException(status_code=502, detail=f"Agent '{agent_id}' failed ({proc.returncode}): {err}")
+
+    reply = _parse_agent_reply(agent_id, stdout_b.decode("utf-8", errors="replace"))
+    remember_turn(session_id, user_text, reply)
+    return reply
+
+
+async def agent_event_stream(agent_id, session_id, transcript, voice_id, request_started, stt_ms):
+    """NDJSON events for a coding-agent turn: full reply, then progressive TTS."""
+    agent_started = time.perf_counter()
+    try:
+        reply = await run_cli_agent(agent_id, session_id, transcript)
+    except HTTPException as exc:
+        yield ndjson_event({"type": "error", "message": str(exc.detail)})
+        return
+    agent_ms = round((time.perf_counter() - agent_started) * 1000)
+    yield ndjson_event({"type": "text", "delta": reply})
+
+    tts_ms_total = 0
+    first_audio_ms = 0
+
+    async def speak(sentence: str) -> str:
+        nonlocal tts_ms_total, first_audio_ms
+        tts_started = time.perf_counter()
+        async with _piper_lock:
+            wav_bytes = await asyncio.to_thread(synthesize_wav, sentence, voice_id)
+        chunk_ms = round((time.perf_counter() - tts_started) * 1000)
+        tts_ms_total += chunk_ms
+        if first_audio_ms == 0:
+            first_audio_ms = round((time.perf_counter() - request_started) * 1000)
+        return ndjson_event({
+            "type": "audio",
+            "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+            "audio_mime": "audio/wav",
+            "tts_ms": chunk_ms,
+        })
+
+    buffer = reply
+    while True:
+        sentence, buffer = pop_speakable_chunk(buffer)
+        if not sentence:
+            break
+        yield await speak(sentence)
+    sentence, _ = pop_speakable_chunk(buffer, force=True)
+    if sentence:
+        yield await speak(sentence)
+
+    yield ndjson_event({
+        "type": "done",
+        "session_id": session_id,
+        "transcript": transcript,
+        "reply": reply,
+        "stt_ms": stt_ms,
+        "llm_ms": agent_ms,
+        "tts_ms": tts_ms_total,
+        "first_audio_ms": first_audio_ms,
+        "total_ms": round((time.perf_counter() - request_started) * 1000),
+    })
+
+
 def pop_speakable_chunk(buffer: str, force: bool = False) -> tuple[str | None, str]:
     # Speak complete sentences immediately. For unusually long sentences, cut
     # near a comma/space so the first audio does not wait indefinitely.
@@ -383,6 +582,8 @@ async def health():
         "piper_voice": PIPER_VOICE,
         "voices": [{"id": vid, "label": spec["label"], "engine": spec["engine"]} for vid, spec in VOICES.items()],
         "voice_default": DEFAULT_VOICE,
+        "agents": available_agents(),
+        "agent_default": "llm",
         "piper_ready": piper_model.exists() and piper_config.exists(),
         "piper_cuda": PIPER_USE_CUDA,
         "streaming_tts": True,
@@ -401,10 +602,16 @@ async def voices():
     }
 
 
+@app.get("/agents")
+async def agents():
+    return {"default": "llm", "agents": available_agents()}
+
+
 @app.post("/api/stream-turn")
 async def stream_turn(
     audio: UploadFile = File(...),
     voice: str = Form(default=""),
+    agent: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -412,6 +619,7 @@ async def stream_turn(
     request_started = time.perf_counter()
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
     voice_id = resolve_voice(voice)
+    agent_id = resolve_agent(agent)
     transcript, stt_ms = await transcribe_upload(audio)
 
     if not transcript:
@@ -447,6 +655,13 @@ async def stream_turn(
             "text": transcript,
             "stt_ms": stt_ms,
         })
+
+        if agent_id != "llm":
+            async for ev in agent_event_stream(
+                agent_id, session_id, transcript, voice_id, request_started, stt_ms
+            ):
+                yield ev
+            return
 
         payload = _llm_payload(build_messages(session_id, transcript), stream=True)
 
@@ -543,6 +758,7 @@ async def stream_turn(
 async def turn(
     audio: UploadFile = File(...),
     voice: str = Form(default=""),
+    agent: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -551,6 +767,7 @@ async def turn(
     started = time.perf_counter()
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
     voice_id = resolve_voice(voice)
+    agent_id = resolve_agent(agent)
     transcript, stt_ms = await transcribe_upload(audio)
 
     if not transcript:
@@ -567,7 +784,10 @@ async def turn(
         }
 
     t1 = time.perf_counter()
-    reply = await ask_ollama(session_id, transcript)
+    if agent_id == "llm":
+        reply = await ask_ollama(session_id, transcript)
+    else:
+        reply = await run_cli_agent(agent_id, session_id, transcript)
     llm_ms = round((time.perf_counter() - t1) * 1000)
 
     try:
