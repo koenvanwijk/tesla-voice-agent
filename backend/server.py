@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -84,7 +84,7 @@ app.add_middleware(
 )
 
 _whisper_model = None
-_piper_voice = None
+_piper_voices: dict = {}
 _whisper_lock = asyncio.Lock()
 _piper_lock = asyncio.Lock()
 _histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY_MESSAGES))
@@ -108,18 +108,43 @@ def get_whisper_model() -> WhisperModel:
     return _whisper_model
 
 
-def get_piper_voice() -> PiperVoice:
-    global _piper_voice
-    if _piper_voice is None:
-        model_path = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx"
-        config_path = PIPER_VOICE_DIR / f"{PIPER_VOICE}.onnx.json"
+_VOICE_LABELS = {
+    "nl_NL-pim-medium": "Pim — Nederlands (medium)",
+    "nl_NL-ronnie-medium": "Ronnie — Nederlands (medium)",
+}
+
+
+def _discover_voices() -> dict[str, dict]:
+    """Available TTS voices keyed by id. Piper voices are any .onnx (+json) in
+    PIPER_VOICE_DIR; future engines (e.g. XTTS on the DGX) register here too."""
+    voices: dict[str, dict] = {}
+    if PIPER_VOICE_DIR.exists():
+        for onnx in sorted(PIPER_VOICE_DIR.glob("*.onnx")):
+            vid = onnx.stem
+            if (PIPER_VOICE_DIR / f"{vid}.onnx.json").exists():
+                voices[vid] = {"engine": "piper", "label": _VOICE_LABELS.get(vid, vid)}
+    return voices
+
+
+VOICES = _discover_voices()
+DEFAULT_VOICE = PIPER_VOICE if PIPER_VOICE in VOICES else next(iter(VOICES), PIPER_VOICE)
+
+
+def resolve_voice(requested: str | None) -> str:
+    v = (requested or "").strip()
+    return v if v in VOICES else DEFAULT_VOICE
+
+
+def get_piper_voice(voice_id: str) -> PiperVoice:
+    if voice_id not in _piper_voices:
+        model_path = PIPER_VOICE_DIR / f"{voice_id}.onnx"
+        config_path = PIPER_VOICE_DIR / f"{voice_id}.onnx.json"
         if not model_path.exists() or not config_path.exists():
-            raise RuntimeError(
-                f"Piper voice '{PIPER_VOICE}' is missing in {PIPER_VOICE_DIR}. "
-                "Run start-windows.ps1 again to download it."
-            )
-        _piper_voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=PIPER_USE_CUDA)
-    return _piper_voice
+            raise RuntimeError(f"Piper-stem '{voice_id}' ontbreekt in {PIPER_VOICE_DIR}.")
+        _piper_voices[voice_id] = PiperVoice.load(
+            model_path, config_path=config_path, use_cuda=PIPER_USE_CUDA
+        )
+    return _piper_voices[voice_id]
 
 
 def transcribe_file(path: str) -> str:
@@ -134,8 +159,8 @@ def transcribe_file(path: str) -> str:
     return " ".join(s.text.strip() for s in segments).strip()
 
 
-def synthesize_wav(text: str) -> bytes:
-    voice = get_piper_voice()
+def synthesize_wav(text: str, voice_id: str | None = None) -> bytes:
+    voice = get_piper_voice(resolve_voice(voice_id))
     syn_config = SynthesisConfig(
         length_scale=PIPER_LENGTH_SCALE,
         noise_scale=PIPER_NOISE_SCALE,
@@ -356,6 +381,8 @@ async def health():
         "whisper_model": WHISPER_MODEL,
         "whisper_device": WHISPER_DEVICE,
         "piper_voice": PIPER_VOICE,
+        "voices": [{"id": vid, "label": spec["label"], "engine": spec["engine"]} for vid, spec in VOICES.items()],
+        "voice_default": DEFAULT_VOICE,
         "piper_ready": piper_model.exists() and piper_config.exists(),
         "piper_cuda": PIPER_USE_CUDA,
         "streaming_tts": True,
@@ -363,15 +390,28 @@ async def health():
     }
 
 
+@app.get("/voices")
+async def voices():
+    return {
+        "default": DEFAULT_VOICE,
+        "voices": [
+            {"id": vid, "label": spec["label"], "engine": spec["engine"]}
+            for vid, spec in VOICES.items()
+        ],
+    }
+
+
 @app.post("/api/stream-turn")
 async def stream_turn(
     audio: UploadFile = File(...),
+    voice: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
     require_token(authorization)
     request_started = time.perf_counter()
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
+    voice_id = resolve_voice(voice)
     transcript, stt_ms = await transcribe_upload(audio)
 
     if not transcript:
@@ -438,7 +478,7 @@ async def stream_turn(
                                 break
                             tts_started = time.perf_counter()
                             async with _piper_lock:
-                                wav_bytes = await asyncio.to_thread(synthesize_wav, sentence)
+                                wav_bytes = await asyncio.to_thread(synthesize_wav, sentence, voice_id)
                             chunk_tts_ms = round((time.perf_counter() - tts_started) * 1000)
                             tts_ms_total += chunk_tts_ms
                             if first_audio_ms == 0:
@@ -457,7 +497,7 @@ async def stream_turn(
             if sentence:
                 tts_started = time.perf_counter()
                 async with _piper_lock:
-                    wav_bytes = await asyncio.to_thread(synthesize_wav, sentence)
+                    wav_bytes = await asyncio.to_thread(synthesize_wav, sentence, voice_id)
                 chunk_tts_ms = round((time.perf_counter() - tts_started) * 1000)
                 tts_ms_total += chunk_tts_ms
                 if first_audio_ms == 0:
@@ -502,6 +542,7 @@ async def stream_turn(
 @app.post("/api/turn")
 async def turn(
     audio: UploadFile = File(...),
+    voice: str = Form(default=""),
     authorization: str | None = Header(default=None),
     x_session_id: str | None = Header(default=None),
 ):
@@ -509,6 +550,7 @@ async def turn(
     require_token(authorization)
     started = time.perf_counter()
     session_id = (x_session_id or str(uuid.uuid4()))[:128]
+    voice_id = resolve_voice(voice)
     transcript, stt_ms = await transcribe_upload(audio)
 
     if not transcript:
@@ -531,7 +573,7 @@ async def turn(
     try:
         t2 = time.perf_counter()
         async with _piper_lock:
-            wav_bytes = await asyncio.to_thread(synthesize_wav, reply)
+            wav_bytes = await asyncio.to_thread(synthesize_wav, reply, voice_id)
         tts_ms = round((time.perf_counter() - t2) * 1000)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Piper TTS failed: {exc}") from exc

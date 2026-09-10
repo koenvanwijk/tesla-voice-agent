@@ -9,6 +9,7 @@
   const saveSettingsButton = document.getElementById('saveSettings');
   const testBackendButton = document.getElementById('testBackend');
   const healthResult = document.getElementById('healthResult');
+  const voiceSelect = document.getElementById('voiceSelect');
 
   let stream = null;
   let audioContext = null;
@@ -84,7 +85,28 @@
   function saveSettings() {
     localStorage.setItem('tva-backend-url', backendUrlInput.value.trim());
     localStorage.setItem('tva-backend-token', backendTokenInput.value.trim());
+    localStorage.setItem('tva-voice', voiceSelect.value);
     healthResult.textContent = 'Opgeslagen.';
+    loadVoices();
+  }
+
+  async function loadVoices() {
+    const base = backendUrlInput.value.trim().replace(/\/$/, '');
+    if (!base) return;
+    try {
+      const response = await fetch(`${base}/voices`, { headers: authHeaders() });
+      if (!response.ok) return;
+      const data = await response.json();
+      const saved = localStorage.getItem('tva-voice') || data.default || '';
+      voiceSelect.innerHTML = '';
+      for (const v of data.voices || []) {
+        const opt = document.createElement('option');
+        opt.value = v.id;
+        opt.textContent = v.label || v.id;
+        voiceSelect.append(opt);
+      }
+      if ([...voiceSelect.options].some(o => o.value === saved)) voiceSelect.value = saved;
+    } catch {}
   }
 
   async function testBackend() {
@@ -256,6 +278,7 @@
     const form = new FormData();
     const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
     form.append('audio', blob, `turn.${ext}`);
+    if (voiceSelect.value) form.append('voice', voiceSelect.value);
 
     let transcriptAdded = false;
     let replyText = '';
@@ -464,6 +487,8 @@
 
   saveSettingsButton.addEventListener('click', saveSettings);
   testBackendButton.addEventListener('click', testBackend);
+  voiceSelect.addEventListener('change', () => localStorage.setItem('tva-voice', voiceSelect.value));
+  loadVoices();
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
